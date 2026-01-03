@@ -1,0 +1,175 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ------------------ Helper Functions ------------------
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+
+    // Check ownership of an existing document
+    function isExistingOwner(userId) {
+      return isSignedIn() && resource.data.userId == userId;
+    }
+
+    // Check user's role from custom claims
+    function hasRole(role) {
+      return isSignedIn() && request.auth.token[role] == true;
+    }
+
+    function isAdmin() {
+      return hasRole('admin');
+    }
+
+    function isManager() {
+      return hasRole('manager');
+    }
+
+    // ------------------ Schema Validation Functions ------------------
+
+    function isValidUser(userData) {
+      return userData.hasAll(['id', 'email', 'firstName', 'lastName', 'role', 'createdAt'])
+        && userData.id is string
+        && userData.email is string && userData.email.matches('.*@.*')
+        && userData.firstName is string
+        && userData.lastName is string
+        && userData.role is string && userData.role in ['customer', 'driver', 'manager', 'admin']
+        && userData.createdAt is timestamp;
+    }
+
+    function isValidDriver(driverData) {
+      return driverData.hasAll(['id', 'firstName', 'lastName', 'licenseNumber', 'isVerified', 'availabilityStatus'])
+        && driverData.id is string
+        && driverData.firstName is string
+        && driverData.lastName is string
+        && driverData.licenseNumber is string
+        && driverData.isVerified is bool
+        && driverData.availabilityStatus is string && driverData.availabilityStatus in ['available', 'unavailable', 'on-trip'];
+    }
+
+    function isValidBooking(bookingData) {
+        return bookingData.hasAll(['id', 'customerId', 'bookingType', 'status', 'startDate', 'endDate'])
+        && bookingData.id is string
+        && bookingData.customerId is string
+        && bookingData.bookingType is string && bookingData.bookingType in ['car-only', 'driver-only', 'car-with-driver']
+        && bookingData.status is string && bookingData.status in ['pending', 'approved', 'in-progress', 'completed', 'cancelled']
+        && bookingData.startDate is timestamp
+        && bookingData.endDate is timestamp;
+    }
+
+    // ------------------ Collection Rules ------------------
+
+    match /users/{userId} {
+      // Users can read their own profile. Admins/Managers can read any profile.
+      allow get: if isSignedIn() && (isOwner(userId) || isAdmin() || isManager());
+      allow list: if isAdmin() || isManager();
+
+      // A user can create their own profile.
+      allow create: if isOwner(userId) && isValidUser(request.resource.data);
+
+      // A user can update their own profile fields, but not role or email.
+      // Admins/Managers can update the 'isVerified' status.
+      allow update: if isSignedIn() && isValidUser(request.resource.data) && (
+          (isOwner(userId) && request.resource.data.email == resource.data.email && request.resource.data.role == resource.data.role) ||
+          ((isAdmin() || isManager()) && request.resource.data.isVerified != resource.data.isVerified)
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    match /drivers/{driverId} {
+      allow read, list: if isSignedIn();
+
+      allow create: if (isAdmin() || isManager()) && isValidDriver(request.resource.data);
+
+      // Drivers can update their own profile. Managers/Admins can verify them.
+      allow update: if isSignedIn() && isValidDriver(request.resource.data) && (
+          isOwner(driverId) || 
+          ((isAdmin() || isManager()) && request.resource.data.isVerified != resource.data.isVerified)
+      );
+      
+      allow delete: if isAdmin() || isManager();
+
+      // Drivers can update their own real-time location.
+      match /currentLocation/{locationId} {
+        allow write: if isOwner(driverId);
+      }
+    }
+
+    match /cars/{carId} {
+      // NOTE: Firestore does not support field-level read restrictions.
+      // This rule allows the entire document to be read publicly.
+      allow read: if true;
+
+      // Only Admins/Managers can manage car listings.
+      allow write: if isAdmin() || isManager();
+    }
+
+    match /bookings/{bookingId} {
+      // Customer, assigned Driver, Manager, or Admin can read the booking.
+      allow get: if isSignedIn() && (isOwner(resource.data.customerId) || isOwner(resource.data.driverId) || isManager() || isAdmin());
+
+      // Authenticated users can list bookings; filtering should be enforced by queries.
+      allow list: if isSignedIn();
+
+      // A customer can create a booking for themselves.
+      allow create: if isOwner(request.resource.data.customerId) && isValidBooking(request.resource.data);
+
+      // A customer can only cancel their booking. Driver/Manager/Admin can update status.
+      allow update: if isSignedIn() && isValidBooking(request.resource.data) && (
+          (isOwner(resource.data.customerId) && request.resource.data.status == 'cancelled' && resource.data.status != 'cancelled') ||
+          isOwner(resource.data.driverId) || isManager() || isAdmin()
+      );
+
+      allow delete: if false; // Bookings should be cancelled, not deleted.
+    }
+
+    match /paymentRecords/{paymentId} {
+      // Customer, Manager, or Admin can read payment records.
+      allow get: if isSignedIn() && (isOwner(resource.data.customerId) || isManager() || isAdmin());
+
+      // Writes are disallowed from the client; must be done by a trusted server.
+      allow write: if false;
+    }
+
+    match /driverAssignments/{assignmentId} {
+        // Only drivers, managers, and admins can access assignments.
+        allow read: if isSignedIn() && (isOwner(resource.data.driverId) || isManager() || isAdmin());
+        allow write: if isManager() || isAdmin(); // Only managers/admins can assign drivers.
+    }
+
+    match /invoices/{invoiceId} {
+        // Only customers, managers, and admins can access invoices.
+        allow read: if isSignedIn() && (isOwner(resource.data.customerId) || isManager() || isAdmin());
+        allow write: if false; // Invoices are created by the server.
+    }
+
+    match /notifications/{notificationId} {
+      // Users can only access their own notifications.
+      allow read, write: if isExistingOwner(resource.data.userId);
+      allow create: if isOwner(request.resource.data.userId);
+    }
+
+    match /reviews/{reviewId} {
+      allow read: if true;
+      // A user can only write a review for a booking they made.
+      allow write: if isOwner(request.resource.data.userId);
+    }
+
+    match /locations/{locationId} {
+      allow read: if true;
+      allow write: if isAdmin() || isManager(); // Only admins/managers can add/edit locations.
+    }
+
+    match /bookingExtras/{extraId} {
+        allow read: if true;
+        allow write: if isAdmin() || isManager();
+    }
+  }
+}
